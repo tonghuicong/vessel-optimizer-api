@@ -215,7 +215,7 @@ def volumes_and_mass(Di, D0, L, n, As_per_ring):
 
 
 # ==========================================================================================
-# PART 1: 评估函数
+# PART 1: 评估函数 (升级：返回详细中间变量)
 # ==========================================================================================
 
 FIXED_PARAMS = {'C1': 2.0, 'C2': 0.3}
@@ -251,18 +251,31 @@ def _core_evaluate(design_vars, vessel_params):
         D0 = vessel_params['Di'] + 2.0 * (de + vessel_params.get('C1', 2.0) + vessel_params.get('C2', 0.3))
         Ls = vessel_params['L'] / (n + 1.0)
         Is, As = calc_rib_Is_As(rib_type, D0, de, **params)
+
+        # 计算许用外压
         p_allow_segment = allowable_p_segment(CALCULATOR, D0, de, Ls, T)
+
+        # 计算所需A值和B值 (用于稳定性校核)
         Bv_required = B_from_p(D0, de, As, Ls, vessel_params['p'])
         A_at_T = [np.interp(Bv_required, d[:, 1], d[:, 0], left=d[0, 0], right=d[-1, 0]) for d in CALCULATOR.all_data]
         A_required = float(np.interp(T, CALCULATOR.temps, A_at_T))
+
+        # 计算所需惯性矩
         Ireq = required_I(D0, de, As, Ls, A_required)
+
         mass = volumes_and_mass(vessel_params['Di'], D0, vessel_params['L'], n, As)
         is_valid = (p_allow_segment >= vessel_params['p']) and (Is >= Ireq)
 
         return {'is_valid': is_valid, 'mass': mass,
                 'margin_I': Is / max(Ireq, 1e-12),
                 'margin_p': p_allow_segment / max(vessel_params['p'], 1e-12),
-                'de': de, 'n': n, 'rib_type': rib_type
+                'de': de, 'n': n, 'rib_type': rib_type,
+                # 新增返回字段
+                'val_A': A_required,
+                'val_B': Bv_required,
+                'Is': Is,
+                'Ireq': Ireq,
+                'p_allow_segment': p_allow_segment
                 }
     except Exception:
         return {'is_valid': False}
@@ -333,7 +346,7 @@ def ga_early_stop_run(problem: Problem, pop_size=120, max_gen=150, seed=1, patie
 
 
 # ==========================================================================================
-# PART 3: API 调用的主流程
+# PART 3: API 调用的主流程 (升级：包含详细输出)
 # ==========================================================================================
 
 def run_api_optimization(length: float, diameter: float, temperature: float, pressure: float, pop_size=200, max_gen=250,
@@ -341,7 +354,6 @@ def run_api_optimization(length: float, diameter: float, temperature: float, pre
     vessel_params = FIXED_PARAMS.copy()
     vessel_params.update({'L': length, 'Di': diameter, 'T': temperature, 'p': pressure})
     print(f"开始全局优化任务，参数: {vessel_params}")
-    print(f"优化设置: pop_size={pop_size}, max_gen={max_gen}, patience={patience}")
 
     problem = PressureVesselProblemVec(vessel_params=vessel_params)
     X_opt, F_opt, info = ga_early_stop_run(problem, pop_size=pop_size, max_gen=max_gen, seed=1, patience=patience,
@@ -363,10 +375,19 @@ def run_api_optimization(length: float, diameter: float, temperature: float, pre
         "margin_stability": round(final_details.get('margin_I', 0), 3),
         "termination_reason": ("early_stop" if info.get('last_gen', max_gen) < max_gen else "max_generations"),
         "generations_run": info.get('last_gen'),
-        "dimensions": {}  # 新增一个 dimensions 字典来存放尺寸
+
+        # === 新增：详细计算过程参数 ===
+        "value_A": float(f"{final_details.get('val_A', 0):.2e}"),  # 使用科学计数法保留两位小数
+        "value_B": round(final_details.get('val_B', 0), 2),
+        "actual_inertia_Is": float(f"{final_details.get('Is', 0):.2e}"),
+        "required_inertia_Ireq": float(f"{final_details.get('Ireq', 0):.2e}"),
+        "allowable_pressure_segment": round(final_details.get('p_allow_segment', 0), 3),
+        # ==============================
+
+        "dimensions": {}
     }
 
-    # 根据加强筋类型，填充具体的尺寸信息
+    # 填充尺寸详情
     rib_type = best_result["rib_type"]
     if rib_type == 'rect':
         best_result["dimensions"] = {
