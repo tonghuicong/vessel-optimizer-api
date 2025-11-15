@@ -215,10 +215,13 @@ def volumes_and_mass(Di, D0, L, n, As_per_ring):
 
 
 # ==========================================================================================
-# PART 1: 评估函数 (升级：返回详细中间变量)
+# PART 1: 评估函数 (最终版)
 # ==========================================================================================
 
-FIXED_PARAMS = {'C1': 2.0, 'C2': 0.3}
+FIXED_PARAMS = {
+    'C_allowance': 2.0,  # 腐蚀裕量 (mm)
+    'delta_thk': 0.3  # 厚度负偏差 (mm)
+}
 CALCULATOR = ExternalPressureCalculator()
 PENALTY_VALUE = 1e12
 RIB_TYPES = ['rect', 'angle', 'tee']
@@ -226,12 +229,18 @@ RIB_TYPES = ['rect', 'angle', 'tee']
 
 def _core_evaluate(design_vars, vessel_params):
     try:
-        de = float(design_vars['de'])
+        de = float(design_vars['de'])  # 有效厚度
         n = int(round(design_vars['n']));
         n = max(1, min(999, n))
         rib_idx = int(round(design_vars['rib_type_idx']));
         rib_idx = int(np.clip(rib_idx, 0, len(RIB_TYPES) - 1))
         rib_type = RIB_TYPES[rib_idx]
+
+        # 计算名义厚度 (向上取整)
+        dn = math.ceil(de + vessel_params.get('C_allowance', 2.0) + vessel_params.get('delta_thk', 0.3))
+
+        # 计算外径 (基于名义厚度)
+        D0 = vessel_params['Di'] + 2.0 * dn
 
         if rib_type == 'rect':
             params = {'ds1': float(design_vars['rect_ds1']), 'hs1': float(design_vars['rect_hs1'])}
@@ -248,19 +257,13 @@ def _core_evaluate(design_vars, vessel_params):
             'is_valid': False}
 
         T = vessel_params['T']
-        D0 = vessel_params['Di'] + 2.0 * (de + vessel_params.get('C1', 2.0) + vessel_params.get('C2', 0.3))
         Ls = vessel_params['L'] / (n + 1.0)
         Is, As = calc_rib_Is_As(rib_type, D0, de, **params)
 
-        # 计算许用外压
         p_allow_segment = allowable_p_segment(CALCULATOR, D0, de, Ls, T)
-
-        # 计算所需A值和B值 (用于稳定性校核)
         Bv_required = B_from_p(D0, de, As, Ls, vessel_params['p'])
         A_at_T = [np.interp(Bv_required, d[:, 1], d[:, 0], left=d[0, 0], right=d[-1, 0]) for d in CALCULATOR.all_data]
         A_required = float(np.interp(T, CALCULATOR.temps, A_at_T))
-
-        # 计算所需惯性矩
         Ireq = required_I(D0, de, As, Ls, A_required)
 
         mass = volumes_and_mass(vessel_params['Di'], D0, vessel_params['L'], n, As)
@@ -270,12 +273,9 @@ def _core_evaluate(design_vars, vessel_params):
                 'margin_I': Is / max(Ireq, 1e-12),
                 'margin_p': p_allow_segment / max(vessel_params['p'], 1e-12),
                 'de': de, 'n': n, 'rib_type': rib_type,
-                # 新增返回字段
-                'val_A': A_required,
-                'val_B': Bv_required,
-                'Is': Is,
-                'Ireq': Ireq,
-                'p_allow_segment': p_allow_segment
+                'val_A': A_required, 'val_B': Bv_required,
+                'Is': Is, 'Ireq': Ireq, 'p_allow_segment': p_allow_segment,
+                'dn': dn  # 新增返回名义厚度
                 }
     except Exception:
         return {'is_valid': False}
@@ -346,7 +346,7 @@ def ga_early_stop_run(problem: Problem, pop_size=120, max_gen=150, seed=1, patie
 
 
 # ==========================================================================================
-# PART 3: API 调用的主流程 (升级：包含详细输出)
+# PART 3: API 调用的主流程 (最终版)
 # ==========================================================================================
 
 def run_api_optimization(length: float, diameter: float, temperature: float, pressure: float, pop_size=200, max_gen=250,
@@ -365,54 +365,39 @@ def run_api_optimization(length: float, diameter: float, temperature: float, pre
     best_design_vars = vec_to_design_vars(X_opt)
     final_details = _core_evaluate(best_design_vars, vessel_params)
 
-    # 准备返回给API的详细结果
     best_result = {
         "rib_type": final_details.get('rib_type'),
         "stiffener_count_n": final_details.get('n'),
         "total_mass_kg": round(F_opt, 2),
-        "shell_thickness_de_mm": round(final_details.get('de', 0), 2),
+        "effective_thickness_de_mm": round(final_details.get('de', 0), 2),
+        "nominal_thickness_dn_mm": final_details.get('dn'),  # 新增
         "margin_strength": round(final_details.get('margin_p', 0), 3),
         "margin_stability": round(final_details.get('margin_I', 0), 3),
         "termination_reason": ("early_stop" if info.get('last_gen', max_gen) < max_gen else "max_generations"),
         "generations_run": info.get('last_gen'),
-
-        # === 新增：详细计算过程参数 ===
-        "value_A": float(f"{final_details.get('val_A', 0):.2e}"),  # 使用科学计数法保留两位小数
+        "value_A": float(f"{final_details.get('val_A', 0):.2e}"),
         "value_B": round(final_details.get('val_B', 0), 2),
         "actual_inertia_Is": float(f"{final_details.get('Is', 0):.2e}"),
         "required_inertia_Ireq": float(f"{final_details.get('Ireq', 0):.2e}"),
         "allowable_pressure_segment": round(final_details.get('p_allow_segment', 0), 3),
-        # ==============================
-
         "dimensions": {}
     }
 
-    # 填充尺寸详情
     rib_type = best_result["rib_type"]
     if rib_type == 'rect':
-        best_result["dimensions"] = {
-            "description": "矩形截面 (高 x 宽)",
-            "hs1_mm": round(best_design_vars['rect_hs1'], 1),
-            "ds1_mm": round(best_design_vars['rect_ds1'], 1)
-        }
+        best_result["dimensions"] = {"description": "矩形截面 (高 x 宽)",
+                                     "hs1_mm": round(best_design_vars['rect_hs1'], 1),
+                                     "ds1_mm": round(best_design_vars['rect_ds1'], 1)}
     elif rib_type == 'angle':
-        best_result["dimensions"] = {
-            "description": "角钢截面 (水平肢长 x 竖肢长 x 厚度)",
-            "hs1_mm": round(best_design_vars['angle_hs1'], 1),
-            "hs2_mm": round(best_design_vars['angle_hs2'], 1),
-            "thickness_mm": round(best_design_vars['angle_thk'], 1)
-        }
+        best_result["dimensions"] = {"description": "角钢截面 (水平肢长 x 竖肢长 x 厚度)",
+                                     "hs1_mm": round(best_design_vars['angle_hs1'], 1),
+                                     "hs2_mm": round(best_design_vars['angle_hs2'], 1),
+                                     "thickness_mm": round(best_design_vars['angle_thk'], 1)}
     elif rib_type == 'tee':
-        best_result["dimensions"] = {
-            "description": "T型钢截面 (翼缘宽 x 腹板高 x 翼缘厚 x 腹板厚)",
-            "hs1_mm": round(best_design_vars['tee_hs1'], 1),
-            "hs2_mm": round(best_design_vars['tee_hs2'], 1),
-            "ds1_mm": round(best_design_vars['tee_ds1'], 1),
-            "ds2_mm": round(best_design_vars['tee_ds2'], 1)
-        }
+        best_result["dimensions"] = {"description": "T型钢截面 (翼缘宽 x 腹板高 x 翼缘厚 x 腹板厚)",
+                                     "hs1_mm": round(best_design_vars['tee_hs1'], 1),
+                                     "hs2_mm": round(best_design_vars['tee_hs2'], 1),
+                                     "ds1_mm": round(best_design_vars['tee_ds1'], 1),
+                                     "ds2_mm": round(best_design_vars['tee_ds2'], 1)}
 
-    return {
-        "status": "success",
-        "message": f"全局优化完成，找到最优解。",
-        "best_solution": best_result
-    }
+    return {"status": "success", "message": f"全局优化完成，找到最优解。", "best_solution": best_result}
