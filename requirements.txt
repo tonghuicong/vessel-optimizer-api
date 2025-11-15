@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+numpy
+scipy
+pymoo>=0.6
