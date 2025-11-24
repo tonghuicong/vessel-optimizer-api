@@ -7,37 +7,32 @@ import optimizer
 app = FastAPI(
     title="外压容器智能设计 API",
     description="提供带加强筋外压容器的全局优化设计与不加筋外压容器的最小壁厚计算两大功能。",
-    version="2.0.0"
+    version="2.1.0"
 )
 
-# === 模型定义：带筋优化 ===
-class StiffenedVesselInput(BaseModel):
+# === 统一的输入模型 ===
+class VesselInput(BaseModel):
     length_mm: float = Field(..., title="筒体计算长度 (mm)", example=8000.0)
     diameter_mm: float = Field(..., title="筒体内径 (mm)", example=1000.0)
     temperature_c: float = Field(..., title="设计温度 (°C)", example=150.0)
     pressure_mpa: float = Field(..., title="外设计压力 (MPa)", example=1.0)
-
-# === 模型定义：不加筋计算 ===
-class UnstiffenedVesselInput(BaseModel):
-    length_mm: float = Field(..., title="筒体计算长度 (mm)", example=3000.0)
-    diameter_mm: float = Field(..., title="筒体内径 (mm)", example=1000.0)
-    temperature_c: float = Field(..., title="设计温度 (°C)", example=30.0)
-    pressure_mpa: float = Field(..., title="外设计压力 (MPa)", example=0.1)
     corrosion_allowance_mm: float = Field(2.0, title="腐蚀裕量 C1 (mm)", example=2.0)
     thickness_tolerance_mm: float = Field(0.3, title="钢板负偏差 C2 (mm)", example=0.3)
 
 
 @app.post("/optimize-stiffened", summary="【优化】带加强筋容器")
-def optimize_stiffened_vessel(input_data: StiffenedVesselInput):
+def optimize_stiffened_vessel(input_data: VesselInput):
     """
-    接收带筋容器的设计参数，运行遗传算法进行全局优化，返回最优设计方案。
+    接收设计参数，运行遗传算法进行全局优化，返回带筋容器的最优设计方案。
     """
     try:
         result = optimizer.run_api_optimization(
             length=input_data.length_mm,
             diameter=input_data.diameter_mm,
             temperature=input_data.temperature_c,
-            pressure=input_data.pressure_mpa
+            pressure=input_data.pressure_mpa,
+            corrosion_allowance=input_data.corrosion_allowance_mm,
+            thickness_tolerance=input_data.thickness_tolerance_mm
         )
         return result
     except Exception as e:
@@ -45,9 +40,9 @@ def optimize_stiffened_vessel(input_data: StiffenedVesselInput):
 
 
 @app.post("/calculate-unstiffened", summary="【计算】不加筋容器最小壁厚")
-def calculate_unstiffened_vessel(input_data: UnstiffenedVesselInput):
+def calculate_unstiffened_vessel(input_data: VesselInput):
     """
-    接收不加筋容器的设计参数，通过迭代计算，确定满足强度和稳定性要求的最小壁厚。
+    接收设计参数，通过迭代计算，确定不加筋容器满足要求的最小壁厚。
     """
     try:
         result = optimizer.calculate_unstiffened_thickness(
@@ -64,4 +59,4 @@ def calculate_unstiffened_vessel(input_data: UnstiffenedVesselInput):
 
 @app.get("/", summary="服务状态检查")
 def read_root():
-    return {"message": "欢迎使用外压容器智能设计 API v2.0，服务运行正常！"}
+    return {"message": "欢迎使用外压容器智能设计 API v2.1，服务运行正常！"}

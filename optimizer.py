@@ -264,9 +264,8 @@ def volumes_and_mass(Di, D0, L, n, As_per_ring):
     return (V_shell + V_ribs_total) * RHO_STEEL_KG_PER_MM3
 
 
-FIXED_PARAMS_STIFFENED = {'C_allowance': 2.0, 'delta_thk': 0.3}
 RIB_TYPES = ['rect', 'angle', 'tee']
-PENALTY_VALUE = 1e12  # === FIXED: 将定义移到这里 ===
+PENALTY_VALUE = 1e12
 
 
 def _core_evaluate_stiffened(design_vars, vessel_params):
@@ -277,7 +276,7 @@ def _core_evaluate_stiffened(design_vars, vessel_params):
         rib_idx = int(round(design_vars['rib_type_idx']));
         rib_idx = int(np.clip(rib_idx, 0, len(RIB_TYPES) - 1))
         rib_type = RIB_TYPES[rib_idx]
-        dn = math.ceil(de + vessel_params.get('C_allowance', 2.0) + vessel_params.get('delta_thk', 0.3))
+        dn = math.ceil(de + vessel_params.get('C_allowance') + vessel_params.get('delta_thk'))
         D0 = vessel_params['Di'] + 2.0 * dn
 
         if rib_type == 'rect':
@@ -318,7 +317,6 @@ def evaluate_for_optimization(design_vars, vessel_params):
     return res['mass'] if res.get('is_valid', False) else PENALTY_VALUE
 
 
-# --- GA 问题定义与运行器 ---
 XL_BASE = np.array([2.0, 1.0, 0.0, 16.0, 3.0, 3.0, 16.0, 20.0, 3.0, 3.0, 10.0, 20.0], dtype=float)
 XU_BASE = np.array([50.0, 20.0, 2.0, 200.0, 60.0, 35.0, 250.0, 250.0, 35.0, 35.0, 150.0, 450.0], dtype=float)
 
@@ -374,17 +372,18 @@ def ga_early_stop_run(problem: Problem, pop_size=120, max_gen=150, seed=1, patie
                                                                              last_gen=cur_gen)
 
 
-# --- 带筋优化主API函数 ---
-def run_api_optimization(length: float, diameter: float, temperature: float, pressure: float, pop_size=200, max_gen=250,
-                         patience=30, min_delta=1e-3):
-    vessel_params = FIXED_PARAMS_STIFFENED.copy()
-    vessel_params.update({'L': length, 'Di': diameter, 'T': temperature, 'p': pressure})
+def run_api_optimization(length: float, diameter: float, temperature: float, pressure: float,
+                         corrosion_allowance: float, thickness_tolerance: float, pop_size=200, max_gen=250, patience=30,
+                         min_delta=1e-3):
+    vessel_params = {
+        'L': length, 'Di': diameter, 'T': temperature, 'p': pressure,
+        'C_allowance': corrosion_allowance, 'delta_thk': thickness_tolerance
+    }
     print(f"开始带筋容器全局优化任务，参数: {vessel_params}")
     problem = PressureVesselProblemVec(vessel_params=vessel_params)
     X_opt, F_opt, info = ga_early_stop_run(problem, pop_size=pop_size, max_gen=max_gen, seed=1, patience=patience,
                                            min_delta=min_delta)
-    if X_opt is None or F_opt >= PENALTY_VALUE: return {"status": "failed",
-                                                        "message": "优化算法未能找到任何可行解，请检查输入参数或尝试放宽设计约束。"}
+    if X_opt is None or F_opt >= PENALTY_VALUE: return {"status": "failed", "message": "优化算法未能找到任何可行解。"}
     best_design_vars = vec_to_design_vars(X_opt)
     final_details = _core_evaluate_stiffened(best_design_vars, vessel_params)
     best_result = {
