@@ -15,33 +15,26 @@ except ImportError:
     pass
 
 # ==========================================================================================
-# PART 0: 规范/材料/曲线计算引擎
+# PART 0: 统一的、更健壮的计算引擎 (单例模式)
 # ==========================================================================================
 
 Q345R_DATA = {
     'yield_strength': {
         'thickness_ranges': [(3, 16), (16, 36), (36, 60), (60, 100), (100, 150), (150, 250)],
         'temperatures': [20, 100, 150, 200, 250, 300, 350, 400, 450],
-        'values': [
-            [345, 315, 295, 275, 250, 230, 215, 200, 190],
-            [325, 295, 275, 255, 235, 215, 200, 190, 180],
-            [315, 285, 260, 240, 220, 200, 185, 175, 165],
-            [305, 275, 250, 225, 205, 185, 175, 165, 155],
-            [285, 260, 240, 220, 200, 180, 170, 160, 150],
-            [265, 245, 230, 215, 195, 175, 165, 155, 145]
-        ]
+        'values': [[345, 315, 295, 275, 250, 230, 215, 200, 190], [325, 295, 275, 255, 235, 215, 200, 190, 180],
+                   [315, 285, 260, 240, 220, 200, 185, 175, 165], [305, 275, 250, 225, 205, 185, 175, 165, 155],
+                   [285, 260, 240, 220, 200, 180, 170, 160, 150], [265, 245, 230, 215, 195, 175, 165, 155, 145]]
     },
     'allowable_stress': {
         'thickness_ranges': [(3, 16), (16, 36), (36, 60), (60, 100), (100, 150), (150, 250)],
         'temperatures': [20, 100, 150, 200, 250, 300, 350, 400, 425, 450, 475],
-        'values': [
-            [189, 189, 189, 183, 167, 153, 143, 125, 93, 66, 43],
-            [185, 185, 185, 170, 157, 143, 133, 125, 93, 66, 43],
-            [181, 181, 173, 160, 147, 133, 123, 117, 93, 66, 43],
-            [181, 181, 167, 150, 147, 133, 117, 110, 93, 66, 43],
-            [178, 173, 160, 147, 133, 120, 113, 107, 93, 66, 43],
-            [174, 163, 153, 143, 130, 117, 110, 103, 93, 66, 43]
-        ]
+        'values': [[189, 189, 189, 183, 167, 153, 143, 125, 93, 66, 43],
+                   [185, 185, 185, 170, 157, 143, 133, 125, 93, 66, 43],
+                   [181, 181, 173, 160, 147, 133, 123, 117, 93, 66, 43],
+                   [181, 181, 167, 150, 147, 133, 117, 110, 93, 66, 43],
+                   [178, 173, 160, 147, 133, 120, 113, 107, 93, 66, 43],
+                   [174, 163, 153, 143, 130, 117, 110, 103, 93, 66, 43]]
     }
 }
 
@@ -64,7 +57,16 @@ class MaterialDB:
 
 
 class ExternalPressureCalculator:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if not cls._instance:
+            cls._instance = super(ExternalPressureCalculator, cls).__new__(cls)
+        return cls._instance
+
     def __init__(self, ba_dir=None):
+        if hasattr(self, 'initialized') and self.initialized:
+            return
         self.Do_t_values = np.array(
             [4, 5, 6, 8, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100, 125, 150, 200, 250, 300, 400, 500, 600, 800, 1000],
             float)
@@ -76,6 +78,7 @@ class ExternalPressureCalculator:
         self.ba_dir = ba_dir or os.getenv("GB150_BA_DIR") or os.path.dirname(__file__)
         self._gen_A_curves()
         self._load_B_files_or_raise()
+        self.initialized = True
 
     def _gen_A_curves(self):
         for m in self.Do_t_values:
@@ -113,6 +116,67 @@ class ExternalPressureCalculator:
         return float(np.interp(T, self.temps, b_at_T))
 
 
+def allowable_p_segment(calc, D0, de, Ls, T):
+    A = calc.A_value(D0, de, Ls);
+    B = calc.B_value(A, T);
+    Do_de = D0 / de
+    if Do_de < 20:
+        Sa = MaterialDB.get_property(de, T, 'allowable_stress');
+        Re = MaterialDB.get_property(de, T, 'yield_strength')
+        sigma0 = min(2 * Sa, 0.9 * Re);
+        p1 = (2.25 / Do_de - 0.0625) * B
+        p2 = (2 * sigma0 / Do_de) * (1.0 - 1.0 / Do_de);
+        return float(min(p1, p2))
+    return float(B / Do_de)
+
+
+# ==========================================================================================
+# 功能一: 不加筋容器壁厚计算
+# ==========================================================================================
+def calculate_unstiffened_thickness(Di, L, temp, p, C1, C2):
+    calculator = ExternalPressureCalculator()
+    de = (Di + 2 * C1 + 2 * C2) / 998
+    max_iter = 2000
+    for iter_count in range(1, max_iter + 1):
+        dn_temp = de + C1 + C2
+        Do = Di + 2 * dn_temp
+        try:
+            A = calculator.A_value(Do, de, L)
+            B = calculator.B_value(A, temp)
+            E = calculator.Et(temp)
+        except (ValueError, IndexError):
+            de += 0.1
+            continue
+        Do_de = Do / de
+        if Do_de < 20:
+            allowable_stress = MaterialDB.get_property(de, temp, 'allowable_stress')
+            yield_strength = MaterialDB.get_property(de, temp, 'yield_strength')
+            sigma0 = min(2 * allowable_stress, 0.9 * yield_strength)
+            p_allowable = min((2.25 / Do_de - 0.0625) * B, (2 * sigma0 / Do_de) * (1 - 1 / Do_de))
+        else:
+            p_allowable = B / Do_de
+        if p_allowable >= p:
+            dn_final = math.ceil(de + C1 + C2)
+            return {
+                "status": "success", "message": "计算成功",
+                "results": {
+                    'effective_thickness_de_mm': round(de, 2),
+                    'nominal_thickness_dn_mm': int(dn_final),
+                    'allowable_pressure': round(p_allowable, 4),
+                    'value_A': float(f"{A:.3e}"),
+                    'value_B': round(B, 2),
+                    'elastic_modulus_E_mpa': float(f"{E:.2e}")
+                }
+            }
+        de += 0.1
+    return {"status": "failed", "message": "在最大迭代次数内未找到合适的壁厚，请检查输入参数是否过于苛刻。"}
+
+
+# ==========================================================================================
+# 功能二: 带筋容器优化
+# ==========================================================================================
+
+# --- 带筋容器专用计算函数 ---
 def required_I(D0, de, As, Ls, A): return (D0 ** 2) * Ls * (de + As / max(Ls, 1e-9)) * A / 10.9
 
 
@@ -129,9 +193,9 @@ def calc_rib_Is_As(rib_type, D0, de, **kw):
     if rib_type == 'rect':
         ds, hs = kw['ds1'], kw['hs1'];
         A2 = ds * hs;
-        Z1 = de + hs / 2.0
-        Z2 = (A1 * (de / 2.0) + A2 * Z1) / (A1 + A2);
-        I2 = ds * hs ** 3 / 12.0
+        Z1 = de + hs / 2.0;
+        Z2 = (A1 * (de / 2.0) + A2 * Z1) / (A1 + A2)
+        I2 = ds * hs ** 3 / 12.0;
         Is = I1 + I2 + (Z2 - de / 2.0) ** 2 * A1 + (Z2 - Z1) ** 2 * A2;
         As = A2
     elif rib_type == 'angle':
@@ -144,7 +208,7 @@ def calc_rib_Is_As(rib_type, D0, de, **kw):
         Z2 = (A1 * (de / 2.0) + (A2 + A3) * Z1) / (A1 + A2 + A3);
         I2 = ds2 * (hs2 - ds1) ** 3 / 12.0
         I3 = hs1 * ds1 ** 3 / 12.0;
-        Is = I1 + I2 + I3 + (Z2 - de / 2.0) ** 2 * A1 + (Z2 - Z_A2) ** 2 * A2 + (Z2 - Z_A3) ** 2 * A3
+        Is = I1 + I2 + I3 + (Z2 - de / 2.0) ** 2 * A1 + (Z2 - Z_A2) ** 2 * A2 + (Z2 - Z_A3) ** 2 * A3;
         As = A2 + A3
     elif rib_type == 'tee':
         ds1, hs1, ds2, hs2 = kw['ds1'], kw['hs1'], kw['ds2'], kw['hs2'];
@@ -156,7 +220,7 @@ def calc_rib_Is_As(rib_type, D0, de, **kw):
         Z2 = (A1 * (de / 2.0) + (A2 + A3) * Z1) / (A1 + A2 + A3);
         I2 = ds2 * (hs2 - ds1) ** 3 / 12.0
         I3 = 2.0 * (hs1 * ds1 ** 3 / 12.0);
-        Is = I1 + I2 + I3 + (Z2 - de / 2.0) ** 2 * A1 + (Z2 - Z_A2) ** 2 * A2 + (Z2 - Z_A3) ** 2 * A3
+        Is = I1 + I2 + I3 + (Z2 - de / 2.0) ** 2 * A1 + (Z2 - Z_A2) ** 2 * A2 + (Z2 - Z_A3) ** 2 * A3;
         As = A2 + A3
     else:
         raise ValueError("未知 rib_type")
@@ -167,7 +231,7 @@ def check_slenderness(rib_type, T, E, **kw):
     slist = []
     if rib_type == 'rect':
         ds, hs = kw['ds1'], kw['hs1'];
-        Re = MaterialDB.get_property(max(ds, 3.0), T, 'yield_strength')
+        Re = MaterialDB.get_property(max(ds, 3.0), T, 'yield_strength');
         limit = 0.375 * np.sqrt(E / Re);
         val = hs / ds;
         slist.append({'ok': val <= limit})
@@ -178,7 +242,7 @@ def check_slenderness(rib_type, T, E, **kw):
         lim1 = 0.375 * np.sqrt(E / Re1);
         lim2 = np.sqrt(E / Re2);
         v1 = hs1 / ds1
-        v2 = (hs2 - ds1) / ds2 if rib_type == 'angle' else hs2 / ds2
+        v2 = (hs2 - ds1) / ds2 if rib_type == 'angle' else hs2 / ds2;
         slist.append({'ok': v1 <= lim1});
         slist.append({'ok': v2 <= lim2})
     return all(s['ok'] for s in slist)
@@ -193,112 +257,78 @@ def check_geom_bounds(rib_type, **kw):
     return False
 
 
-def allowable_p_segment(calc, D0, de, Ls, T):
-    A = calc.A_value(D0, de, Ls);
-    B = calc.B_value(A, T);
-    Do_de = D0 / de
-    if Do_de < 20:
-        Sa = MaterialDB.get_property(de, T, 'allowable_stress');
-        Re = MaterialDB.get_property(de, T, 'yield_strength')
-        sigma0 = min(2 * Sa, 0.9 * Re);
-        p1 = (2.25 / Do_de - 0.0625) * B
-        p2 = (2 * sigma0 / Do_de) * (1.0 - 1.0 / Do_de);
-        return float(min(p1, p2))
-    return float(B / Do_de)
-
-
 def volumes_and_mass(Di, D0, L, n, As_per_ring):
-    RHO_STEEL_KG_PER_MM3 = 7.85e-6
+    RHO_STEEL_KG_PER_MM3 = 7.85e-6;
     V_shell = math.pi * L * ((D0 / 2.0) ** 2 - (Di / 2.0) ** 2)
-    V_ribs_total = n * As_per_ring * math.pi * D0
+    V_ribs_total = n * As_per_ring * math.pi * D0;
     return (V_shell + V_ribs_total) * RHO_STEEL_KG_PER_MM3
 
 
-# ==========================================================================================
-# PART 1: 评估函数 (最终版)
-# ==========================================================================================
-
-FIXED_PARAMS = {
-    'C_allowance': 2.0,  # 腐蚀裕量 (mm)
-    'delta_thk': 0.3  # 厚度负偏差 (mm)
-}
-CALCULATOR = ExternalPressureCalculator()
-PENALTY_VALUE = 1e12
+FIXED_PARAMS_STIFFENED = {'C_allowance': 2.0, 'delta_thk': 0.3}
 RIB_TYPES = ['rect', 'angle', 'tee']
+PENALTY_VALUE = 1e12  # === FIXED: 将定义移到这里 ===
 
 
-def _core_evaluate(design_vars, vessel_params):
+def _core_evaluate_stiffened(design_vars, vessel_params):
     try:
-        de = float(design_vars['de'])  # 有效厚度
+        de = float(design_vars['de'])
         n = int(round(design_vars['n']));
         n = max(1, min(999, n))
         rib_idx = int(round(design_vars['rib_type_idx']));
         rib_idx = int(np.clip(rib_idx, 0, len(RIB_TYPES) - 1))
         rib_type = RIB_TYPES[rib_idx]
-
-        # 计算名义厚度 (向上取整)
         dn = math.ceil(de + vessel_params.get('C_allowance', 2.0) + vessel_params.get('delta_thk', 0.3))
-
-        # 计算外径 (基于名义厚度)
         D0 = vessel_params['Di'] + 2.0 * dn
 
         if rib_type == 'rect':
             params = {'ds1': float(design_vars['rect_ds1']), 'hs1': float(design_vars['rect_hs1'])}
         elif rib_type == 'angle':
-            thk = float(design_vars['angle_thk'])
+            thk = float(design_vars['angle_thk']);
             params = {'ds1': thk, 'ds2': thk, 'hs1': float(design_vars['angle_hs1']),
                       'hs2': float(design_vars['angle_hs2'])}
         else:
             params = {'ds1': float(design_vars['tee_ds1']), 'ds2': float(design_vars['tee_ds2']),
                       'hs1': float(design_vars['tee_hs1']), 'hs2': float(design_vars['tee_hs2'])}
 
-        if not check_geom_bounds(rib_type, **params): return {'is_valid': False}
-        if not check_slenderness(rib_type, vessel_params['T'], CALCULATOR.Et(vessel_params['T']), **params): return {
-            'is_valid': False}
-
+        calculator = ExternalPressureCalculator()
         T = vessel_params['T']
+        if not check_geom_bounds(rib_type, **params): return {'is_valid': False}
+        if not check_slenderness(rib_type, T, calculator.Et(T), **params): return {'is_valid': False}
+
         Ls = vessel_params['L'] / (n + 1.0)
         Is, As = calc_rib_Is_As(rib_type, D0, de, **params)
-
-        p_allow_segment = allowable_p_segment(CALCULATOR, D0, de, Ls, T)
+        p_allow_segment = allowable_p_segment(calculator, D0, de, Ls, T)
         Bv_required = B_from_p(D0, de, As, Ls, vessel_params['p'])
-        A_at_T = [np.interp(Bv_required, d[:, 1], d[:, 0], left=d[0, 0], right=d[-1, 0]) for d in CALCULATOR.all_data]
-        A_required = float(np.interp(T, CALCULATOR.temps, A_at_T))
+        A_at_T = [np.interp(Bv_required, d[:, 1], d[:, 0], left=d[0, 0], right=d[-1, 0]) for d in calculator.all_data]
+        A_required = float(np.interp(T, calculator.temps, A_at_T))
         Ireq = required_I(D0, de, As, Ls, A_required)
-
         mass = volumes_and_mass(vessel_params['Di'], D0, vessel_params['L'], n, As)
         is_valid = (p_allow_segment >= vessel_params['p']) and (Is >= Ireq)
 
-        return {'is_valid': is_valid, 'mass': mass,
-                'margin_I': Is / max(Ireq, 1e-12),
+        return {'is_valid': is_valid, 'mass': mass, 'margin_I': Is / max(Ireq, 1e-12),
                 'margin_p': p_allow_segment / max(vessel_params['p'], 1e-12),
-                'de': de, 'n': n, 'rib_type': rib_type,
-                'val_A': A_required, 'val_B': Bv_required,
-                'Is': Is, 'Ireq': Ireq, 'p_allow_segment': p_allow_segment,
-                'dn': dn  # 新增返回名义厚度
-                }
+                'de': de, 'n': n, 'rib_type': rib_type, 'val_A': A_required, 'val_B': Bv_required,
+                'Is': Is, 'Ireq': Ireq, 'p_allow_segment': p_allow_segment, 'dn': dn}
     except Exception:
         return {'is_valid': False}
 
 
 def evaluate_for_optimization(design_vars, vessel_params):
-    res = _core_evaluate(design_vars, vessel_params)
+    res = _core_evaluate_stiffened(design_vars, vessel_params)
     return res['mass'] if res.get('is_valid', False) else PENALTY_VALUE
 
 
-# ==========================================================================================
-# PART 2: GA 问题定义
-# ==========================================================================================
-
+# --- GA 问题定义与运行器 ---
 XL_BASE = np.array([2.0, 1.0, 0.0, 16.0, 3.0, 3.0, 16.0, 20.0, 3.0, 3.0, 10.0, 20.0], dtype=float)
 XU_BASE = np.array([50.0, 20.0, 2.0, 200.0, 60.0, 35.0, 250.0, 250.0, 35.0, 35.0, 150.0, 450.0], dtype=float)
 
 
 def vec_to_design_vars(x, fixed=None):
-    dv = {'de': float(x[0]), 'n': int(round(x[1])), 'rib_type_idx': int(round(x[2])),
-          'rect_hs1': float(x[3]), 'rect_ds1': float(x[4]), 'angle_thk': float(x[5]),
-          'angle_hs1': float(x[6]), 'angle_hs2': float(x[7]), 'tee_ds1': float(x[8]),
-          'tee_ds2': float(x[9]), 'tee_hs1': float(x[10]), 'tee_hs2': float(x[11])}
+    dv = {'de': float(x[0]), 'n': int(round(x[1])), 'rib_type_idx': int(round(x[2])), 'rect_hs1': float(x[3]),
+          'rect_ds1': float(x[4]),
+          'angle_thk': float(x[5]), 'angle_hs1': float(x[6]), 'angle_hs2': float(x[7]), 'tee_ds1': float(x[8]),
+          'tee_ds2': float(x[9]),
+          'tee_hs1': float(x[10]), 'tee_hs2': float(x[11])}
     if fixed: dv.update(fixed)
     return dv
 
@@ -339,50 +369,38 @@ def ga_early_stop_run(problem: Problem, pop_size=120, max_gen=150, seed=1, patie
             else:
                 no_improve += 1
         if seen_feasible and cur_gen >= warmup_gen and no_improve >= patience: break
-
     if algo.opt is None or not np.isfinite(algo.opt.get("F")[0]): return None, PENALTY_VALUE, {}
     return np.array(algo.opt.get("X")[0]), float(algo.opt.get("F")[0]), dict(best_F=best_F, best_gen=best_gen,
                                                                              last_gen=cur_gen)
 
 
-# ==========================================================================================
-# PART 3: API 调用的主流程 (最终版)
-# ==========================================================================================
-
+# --- 带筋优化主API函数 ---
 def run_api_optimization(length: float, diameter: float, temperature: float, pressure: float, pop_size=200, max_gen=250,
                          patience=30, min_delta=1e-3):
-    vessel_params = FIXED_PARAMS.copy()
+    vessel_params = FIXED_PARAMS_STIFFENED.copy()
     vessel_params.update({'L': length, 'Di': diameter, 'T': temperature, 'p': pressure})
-    print(f"开始全局优化任务，参数: {vessel_params}")
-
+    print(f"开始带筋容器全局优化任务，参数: {vessel_params}")
     problem = PressureVesselProblemVec(vessel_params=vessel_params)
     X_opt, F_opt, info = ga_early_stop_run(problem, pop_size=pop_size, max_gen=max_gen, seed=1, patience=patience,
                                            min_delta=min_delta)
-
-    if X_opt is None or F_opt >= PENALTY_VALUE:
-        return {"status": "failed", "message": "优化算法未能找到任何可行解，请检查输入参数或尝试放宽设计约束。"}
-
+    if X_opt is None or F_opt >= PENALTY_VALUE: return {"status": "failed",
+                                                        "message": "优化算法未能找到任何可行解，请检查输入参数或尝试放宽设计约束。"}
     best_design_vars = vec_to_design_vars(X_opt)
-    final_details = _core_evaluate(best_design_vars, vessel_params)
-
+    final_details = _core_evaluate_stiffened(best_design_vars, vessel_params)
     best_result = {
-        "rib_type": final_details.get('rib_type'),
-        "stiffener_count_n": final_details.get('n'),
+        "rib_type": final_details.get('rib_type'), "stiffener_count_n": final_details.get('n'),
         "total_mass_kg": round(F_opt, 2),
         "effective_thickness_de_mm": round(final_details.get('de', 0), 2),
-        "nominal_thickness_dn_mm": final_details.get('dn'),  # 新增
+        "nominal_thickness_dn_mm": final_details.get('dn'),
         "margin_strength": round(final_details.get('margin_p', 0), 3),
         "margin_stability": round(final_details.get('margin_I', 0), 3),
         "termination_reason": ("early_stop" if info.get('last_gen', max_gen) < max_gen else "max_generations"),
         "generations_run": info.get('last_gen'),
-        "value_A": float(f"{final_details.get('val_A', 0):.2e}"),
-        "value_B": round(final_details.get('val_B', 0), 2),
+        "value_A": float(f"{final_details.get('val_A', 0):.2e}"), "value_B": round(final_details.get('val_B', 0), 2),
         "actual_inertia_Is": float(f"{final_details.get('Is', 0):.2e}"),
         "required_inertia_Ireq": float(f"{final_details.get('Ireq', 0):.2e}"),
-        "allowable_pressure_segment": round(final_details.get('p_allow_segment', 0), 3),
-        "dimensions": {}
+        "allowable_pressure_segment": round(final_details.get('p_allow_segment', 0), 3), "dimensions": {}
     }
-
     rib_type = best_result["rib_type"]
     if rib_type == 'rect':
         best_result["dimensions"] = {"description": "矩形截面 (高 x 宽)",
@@ -399,5 +417,4 @@ def run_api_optimization(length: float, diameter: float, temperature: float, pre
                                      "hs2_mm": round(best_design_vars['tee_hs2'], 1),
                                      "ds1_mm": round(best_design_vars['tee_ds1'], 1),
                                      "ds2_mm": round(best_design_vars['tee_ds2'], 1)}
-
     return {"status": "success", "message": f"全局优化完成，找到最优解。", "best_solution": best_result}
